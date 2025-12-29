@@ -51,7 +51,11 @@ A periodic health check monitors for missing `AudioAdded` acknowledgments. If no
    ```bash
    npm install
    ```
-3. Start the development server:
+3. Start the JWT server:
+   ```bash
+   npm run server
+   ```
+4. Start the development server:
    ```bash
    npm run dev
    ```
