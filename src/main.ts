@@ -12,12 +12,15 @@ const languageDatalist = document.getElementById(
 ) as HTMLDataListElement | null;
 const startButton = document.getElementById('start') as HTMLButtonElement;
 const stopButton = document.getElementById('stop') as HTMLButtonElement;
+const downloadButton = document.getElementById('download') as HTMLButtonElement;
 const transcriptEl = document.getElementById('transcript') as HTMLPreElement;
 
 let audioContext: AudioContext | null = null;
 let pcmRecorder: PCMRecorder | null = null;
 let client: RealtimeClient | null = null;
 let finalText = '';
+let isReconnecting = false;
+let recordedAudio: Int16Array[] = [];
 
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_DURATION_MS = 50;
@@ -25,6 +28,8 @@ const CHUNK_SAMPLES = Math.round((TARGET_SAMPLE_RATE * CHUNK_DURATION_MS) / 1000
 const ACK_TIMEOUT_MS = 3000;
 const MAX_DELAY = 1;
 const HEALTH_CHECK_INTERVAL_MS = 1000;
+const SLIDING_BUFFER_MS = 2000;
+const SLIDING_BUFFER_SAMPLES = Math.round((TARGET_SAMPLE_RATE * SLIDING_BUFFER_MS) / 1000);
 
 let audioBufferQueue: Int16Array[] = [];
 let queuedSamples = 0;
@@ -32,6 +37,9 @@ let nextSeqNo = 1;
 let pendingChunks: Map<number, { chunk: Int16Array; sentAt: number }> = new Map();
 let healthCheckIntervalId: number | null = null;
 let sessionStopped = true;
+let savedQueuedSamples = 0;
+let slidingBuffer: Int16Array[] = [];
+let slidingBufferSamples = 0;
 
 function appendStatus(message: string) {
   transcriptEl.textContent += `\n[status] ${message}`;
@@ -120,89 +128,34 @@ async function startSession() {
     client = new RealtimeClient({ url });
     finalText = '';
     transcriptEl.textContent = '';
+    recordedAudio = [];
+    downloadButton.disabled = true;
 
-    client.addEventListener('receiveMessage', ({ data }) => {
-      
-      if (data.message === 'AddTranscript') {
-        const results = data.results || [];
-        for (const result of results) {
-          const content = result.alternatives?.[0]?.content;
-          if (content) {
-            if (result.type === 'punctuation') {
-              finalText = `${finalText}${content}`;
-            } else {
-              finalText = `${finalText} ${content}`;
-            }
-          }
-        }
-        finalText = finalText.trim();
-        transcriptEl.textContent = finalText;
-      } else if (data.message === 'EndOfTranscript') {
-        appendStatus('End of transcript');
-      } else if (data.message === 'AudioAdded') {
-        const ackSeqNo = data.seq_no;
-        if (typeof ackSeqNo === 'number') {
-          for (let i = 1; i <= ackSeqNo; i++) {
-            pendingChunks.delete(i);
-          }
-        }
-      }
-    });
+    client.addEventListener('receiveMessage', handleReceiveMessage);
+    client.addEventListener('socketStateChange', createSocketStateHandler(url, language));
 
-    client.addEventListener('socketStateChange', (e: any) => {
-      console.log('socket state:', e.socketState);
-      if (!sessionStopped && (e.socketState === 'closed' || e.socketState === 'error')) {
-        appendStatus('WebSocket closed, reconnecting...');
-        void reconnectSession(url, language);
-      }
-    });
-
-    await client.start(jwt, {
-      audio_format: {
-        type: 'raw',
-        encoding: 'pcm_s16le',
-        sample_rate: TARGET_SAMPLE_RATE
-      },
-      transcription_config: {
-        language,
-        operating_point: 'enhanced',
-        enable_partials: true,
-        max_delay: MAX_DELAY
-      }
-    } as any);
+    await client.start(jwt, getStartConfig(language));
 
     // Set up PCMRecorder to capture browser PCM and forward as 16kHz pcm_s16le
     audioContext = new AudioContext();
     pcmRecorder = new PCMRecorder(PCMAudioWorkletUrl);
 
     pcmRecorder.addEventListener('audio', (event: InputAudioEvent) => {
-      if (!client || !audioContext) return;
+      if (sessionStopped || !audioContext) {
+        console.log('audio event ignored:', { sessionStopped, hasAudioContext: !!audioContext });
+        return;
+      }
       const floats = event.data;
       const inputSampleRate = audioContext.sampleRate;
 
       const resampled = resampleTo16k(floats, inputSampleRate, TARGET_SAMPLE_RATE);
+      recordedAudio.push(resampled);
       enqueueAudio(resampled);
     });
 
     await pcmRecorder.startRecording({ audioContext });
 
-    if (healthCheckIntervalId !== null) {
-      clearInterval(healthCheckIntervalId);
-    }
-
-    healthCheckIntervalId = window.setInterval(() => {
-      if (!client) return;
-      if (sessionStopped) return;
-      const now = Date.now();
-      for (const { sentAt } of pendingChunks.values()) {
-        if (now - sentAt > ACK_TIMEOUT_MS) {
-          appendStatus('No AudioAdded ack for >3s, reconnecting...');
-          console.log('Health check: triggering reconnect due to missing AudioAdded ack for >5s');
-          void reconnectSession(url, language);
-          break;
-        }
-      }
-    }, HEALTH_CHECK_INTERVAL_MS);
+    startHealthCheck(url, language);
 
     sessionStopped = false;
     startButton.disabled = true;
@@ -234,6 +187,9 @@ async function stopSession() {
   queuedSamples = 0;
   pendingChunks.clear();
   nextSeqNo = 1;
+  isReconnecting = false;
+  slidingBuffer = [];
+  slidingBufferSamples = 0;
 
   if (healthCheckIntervalId !== null) {
     clearInterval(healthCheckIntervalId);
@@ -242,6 +198,7 @@ async function stopSession() {
 
   startButton.disabled = false;
   stopButton.disabled = true;
+  downloadButton.disabled = recordedAudio.length === 0;
   appendStatus('Session stopped');
 }
 
@@ -253,7 +210,154 @@ stopButton.addEventListener('click', () => {
   void stopSession();
 });
 
+downloadButton.addEventListener('click', () => {
+  downloadWavFile();
+});
+
 void populateLanguagesFromDiscovery();
+
+function handleReceiveMessage({ data }: { data: any }) {
+  // console.log('receiveMessage:', data.message, data);
+  if (data.message === 'AddTranscript') {
+    const results = data.results || [];
+    for (const result of results) {
+      const content = result.alternatives?.[0]?.content;
+      if (content) {
+        if (result.type === 'punctuation') {
+          finalText = `${finalText}${content}`;
+        } else {
+          finalText = `${finalText} ${content}`;
+        }
+      }
+    }
+    finalText = finalText.trim();
+    transcriptEl.textContent = finalText;
+  } else if (data.message === 'EndOfTranscript') {
+    appendStatus('End of transcript');
+  } else if (data.message === 'AudioAdded') {
+    const ackSeqNo = data.seq_no;
+    // console.log(`AudioAdded ack: seq_no=${ackSeqNo}, pendingChunks before=${pendingChunks.size}`);
+    if (typeof ackSeqNo === 'number') {
+      for (let i = 1; i <= ackSeqNo; i++) {
+        pendingChunks.delete(i);
+      }
+    }
+    // console.log(`AudioAdded ack: pendingChunks after=${pendingChunks.size}`);
+  } else if (data.message === 'RecognitionStarted') {
+    console.log('RecognitionStarted received');
+  } else if (data.message === 'Error') {
+    console.error('Server error:', data);
+  }
+}
+
+function createSocketStateHandler(url: string, language: string) {
+  return (e: any) => {
+    console.log('socket state:', e.socketState);
+    if (!sessionStopped && (e.socketState === 'closed' || e.socketState === 'error')) {
+      appendStatus('WebSocket closed, reconnecting...');
+      void reconnectSession(url, language);
+    }
+  };
+}
+
+function getStartConfig(language: string) {
+  return {
+    audio_format: {
+      type: 'raw',
+      encoding: 'pcm_s16le',
+      sample_rate: TARGET_SAMPLE_RATE
+    },
+    transcription_config: {
+      language,
+      operating_point: 'enhanced',
+      enable_partials: true,
+      max_delay: MAX_DELAY
+    }
+  } as any;
+}
+
+function startHealthCheck(url: string, language: string) {
+  if (healthCheckIntervalId !== null) {
+    clearInterval(healthCheckIntervalId);
+  }
+
+  healthCheckIntervalId = window.setInterval(() => {
+    if (!client) return;
+    if (sessionStopped) return;
+    const now = Date.now();
+    for (const { sentAt } of pendingChunks.values()) {
+      if (now - sentAt > ACK_TIMEOUT_MS) {
+        appendStatus('No AudioAdded ack for >3s, reconnecting...');
+        void reconnectSession(url, language);
+        break;
+      }
+    }
+  }, HEALTH_CHECK_INTERVAL_MS);
+}
+
+function downloadWavFile() {
+  if (recordedAudio.length === 0) {
+    alert('No audio recorded');
+    return;
+  }
+
+  const totalSamples = recordedAudio.reduce((sum, arr) => sum + arr.length, 0);
+  const combinedAudio = new Int16Array(totalSamples);
+  let offset = 0;
+  for (const chunk of recordedAudio) {
+    combinedAudio.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  const wavBuffer = createWavFile(combinedAudio, TARGET_SAMPLE_RATE);
+  const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `recording-${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  appendStatus('WAV file downloaded');
+}
+
+function createWavFile(samples: Int16Array, sampleRate: number): ArrayBuffer {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const bytesPerSample = bitsPerSample / 8;
+  const blockAlign = numChannels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  for (let i = 0; i < samples.length; i++) {
+    view.setInt16(44 + i * 2, samples[i], true);
+  }
+
+  return buffer;
+}
 
 function resampleTo16k(
   input: Float32Array,
@@ -287,15 +391,29 @@ function resampleTo16k(
 }
 
 async function reconnectSession(url: string, language: string) {
-  const unsentChunks: Int16Array[] = [];
-  for (const { chunk } of pendingChunks.values()) {
-    unsentChunks.push(chunk);
+  if (isReconnecting) {
+    console.log('Already reconnecting, skipping duplicate reconnect');
+    return;
   }
+  isReconnecting = true;
+
+  // Use sliding buffer for replay - this includes recently sent audio that may not have been transcribed yet
+  const replayChunks = [...slidingBuffer];
+  slidingBuffer = [];
+  slidingBufferSamples = 0;
+
+  const savedQueue = [...audioBufferQueue];
+  savedQueuedSamples = queuedSamples;
+  audioBufferQueue = [];
+  queuedSamples = 0;
 
   console.log('reconnectSession: starting reconnect', {
     url,
     language,
-    unsentChunkCount: unsentChunks.length
+    replayChunkCount: replayChunks.length,
+    queuedBuffers: savedQueue.length,
+    queuedSamples: savedQueuedSamples,
+    pendingChunksBeforeClear: pendingChunks.size
   });
 
   pendingChunks.clear();
@@ -318,79 +436,63 @@ async function reconnectSession(url: string, language: string) {
 
   client = new RealtimeClient({ url });
 
-  client.addEventListener('receiveMessage', ({ data }) => {
-    if (data.message === 'AddTranscript') {
-      const results = data.results || [];
-      for (const result of results) {
-        const content = result.alternatives?.[0]?.content;
-        if (content) {
-          if (result.is_eos) {
-            finalText = `${finalText}${content}`;
-          } else {
-            finalText = `${finalText} ${content}`;
-          }
-        }
-      }
-      finalText = finalText.trim();
-      transcriptEl.textContent = finalText;
-    } else if (data.message === 'EndOfTranscript') {
-      appendStatus('End of transcript');
-    } else if (data.message === 'AudioAdded') {
-      const ackSeqNo = data.seq_no;
-      if (typeof ackSeqNo === 'number') {
-        for (let i = 1; i <= ackSeqNo; i++) {
-          pendingChunks.delete(i);
-        }
-      }
-    }
+  client.addEventListener('receiveMessage', handleReceiveMessage);
+  client.addEventListener('socketStateChange', createSocketStateHandler(url, language));
+
+  await client.start(jwt, getStartConfig(language));
+
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  console.log('Reconnect: session started, restoring queue and sending buffered chunks', {
+    replayChunks: replayChunks.length,
+    savedQueueBuffers: savedQueue.length,
+    savedQueuedSamples: savedQueuedSamples
   });
 
-  client.addEventListener('socketStateChange', (e: any) => {
-    console.log('socket state (reconnect):', e.socketState);
-    if (!sessionStopped && (e.socketState === 'closed' || e.socketState === 'error')) {
-      appendStatus('WebSocket closed after reconnect, reconnecting again...');
-      void reconnectSession(url, language);
-    }
-  });
+  audioBufferQueue = [...savedQueue, ...audioBufferQueue];
+  queuedSamples = savedQueuedSamples + queuedSamples;
 
-  await client.start(jwt, {
-    audio_format: {
-      type: 'raw',
-      encoding: 'pcm_s16le',
-      sample_rate: TARGET_SAMPLE_RATE
-    },
-    transcription_config: {
-      language,
-      operating_point: 'enhanced',
-      enable_partials: true,
-      max_delay: MAX_DELAY
-    }
-  } as any);
+  isReconnecting = false;
 
-  if (healthCheckIntervalId !== null) {
-    clearInterval(healthCheckIntervalId);
-  }
-
-  healthCheckIntervalId = window.setInterval(() => {
-    if (!client) return;
-    if (sessionStopped) return;
-    const now = Date.now();
-    for (const { sentAt } of pendingChunks.values()) {
-      if (now - sentAt > ACK_TIMEOUT_MS) {
-        appendStatus('No AudioAdded ack for >5s, reconnecting...');
-        void reconnectSession(url, language);
-        break;
-      }
-    }
-  }, HEALTH_CHECK_INTERVAL_MS);
-
-  for (const chunk of unsentChunks) {
+  // Send replay chunks (sliding buffer) first
+  let replayCount = 0;
+  for (const chunk of replayChunks) {
     if (!client) break;
     const seqNo = nextSeqNo++;
     const now = Date.now();
     pendingChunks.set(seqNo, { chunk, sentAt: now });
     const pcmBytes = int16ToLittleEndian(chunk);
     client.sendAudio(pcmBytes);
+    addToSlidingBuffer(chunk);
+    replayCount++;
+  }
+  console.log(`Reconnect: sent ${replayCount} replay chunks from sliding buffer`);
+
+  let queueSentCount = 0;
+  while (queuedSamples >= CHUNK_SAMPLES) {
+    const chunk = dequeueChunk();
+    if (!chunk || !client) break;
+    const seqNo = nextSeqNo++;
+    const now = Date.now();
+    pendingChunks.set(seqNo, { chunk, sentAt: now });
+    const pcmBytes = int16ToLittleEndian(chunk);
+    client.sendAudio(pcmBytes);
+    queueSentCount++;
+  }
+  console.log(`Reconnect: sent ${queueSentCount} chunks from restored queue`);
+  console.log(`Reconnect: complete, remaining queued samples: ${queuedSamples}`);
+
+  startHealthCheck(url, language);
+}
+
+function addToSlidingBuffer(chunk: Int16Array) {
+  slidingBuffer.push(chunk);
+  slidingBufferSamples += chunk.length;
+
+  // Trim buffer to keep only last SLIDING_BUFFER_SAMPLES
+  while (slidingBufferSamples > SLIDING_BUFFER_SAMPLES && slidingBuffer.length > 0) {
+    const removed = slidingBuffer.shift()!;
+    slidingBufferSamples -= removed.length;
   }
 }
 
@@ -399,8 +501,12 @@ function enqueueAudio(samples: Int16Array) {
   audioBufferQueue.push(samples);
   queuedSamples += samples.length;
 
-  if (!client || sessionStopped) return;
+  if (!client || sessionStopped || isReconnecting) {
+    console.log('enqueueAudio: skipping send', { hasClient: !!client, sessionStopped, isReconnecting, queuedSamples });
+    return;
+  }
 
+  let chunksSent = 0;
   while (queuedSamples >= CHUNK_SAMPLES) {
     const chunk = dequeueChunk();
     if (!chunk) break;
@@ -409,6 +515,11 @@ function enqueueAudio(samples: Int16Array) {
     pendingChunks.set(seqNo, { chunk, sentAt: now });
     const pcmBytes = int16ToLittleEndian(chunk);
     client.sendAudio(pcmBytes);
+    addToSlidingBuffer(chunk);
+    chunksSent++;
+  }
+  if (chunksSent > 0) {
+    // console.log(`enqueueAudio: sent ${chunksSent} chunks, nextSeqNo=${nextSeqNo}, pendingChunks=${pendingChunks.size}, remainingQueuedSamples=${queuedSamples}`);
   }
 }
 
