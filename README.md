@@ -74,16 +74,16 @@ A periodic health check monitors for missing `AudioAdded` acknowledgments. If no
 
 ```
 ┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  PCMRecorder    │────▶│ Audio Queue  │────▶│ WebSocket Send  │
+│  PCMRecorder    │──>  │ Audio Queue  │────>│ WebSocket Send  │
 │  (Browser Mic)  │     │ + Resampling │     │ + Seq Numbers   │
 └─────────────────┘     └──────────────┘     └────────┬────────┘
                                                       │
                         ┌──────────────┐              │
-                        │ Sliding      │◀─────────────┘
+                        │ Sliding      │<─────────────┘
                         │ Buffer (2s)  │
                         └──────┬───────┘
                                │
-                               ▼ (on reconnect)
+                               v (on reconnect)
                         ┌──────────────┐
                         │ Replay to    │
                         │ New Session  │
