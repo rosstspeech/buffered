@@ -23,7 +23,7 @@ A browser-based real-time transcription client with automatic reconnection and a
 
 When a WebSocket disconnection is detected:
 
-1. **Sliding buffer** (last 2 seconds of sent audio) is preserved
+1. **Sliding buffer** (last n seconds of sent audio) is preserved (based on last AddTranscript message seen)
 2. **Pending queue** (unsent audio) is saved
 3. New session is established with fresh JWT
 4. Sliding buffer is replayed first (covers audio that may have been acknowledged but not transcribed)
@@ -78,13 +78,14 @@ A periodic health check monitors for missing `AudioAdded` acknowledgments. If no
 
 ```
 ┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  PCMRecorder    │──>  │ Audio Queue  │────>│ WebSocket Send  │
+│  PCMRecorder    │────>│ Audio Queue  │────>│ WebSocket Send  │
 │  (Browser Mic)  │     │ + Resampling │     │ + Seq Numbers   │
 └─────────────────┘     └──────────────┘     └────────┬────────┘
                                                       │
                         ┌──────────────┐              │
                         │ Sliding      │<─────────────┘
-                        │ Buffer (2s)  │
+                        │ Buffer       │
+                        │ (variable)   │
                         └──────┬───────┘
                                │
                                v (on reconnect)
