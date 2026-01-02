@@ -28,8 +28,7 @@ const CHUNK_SAMPLES = Math.round((TARGET_SAMPLE_RATE * CHUNK_DURATION_MS) / 1000
 const ACK_TIMEOUT_MS = 3000;
 const MAX_DELAY = 1;
 const HEALTH_CHECK_INTERVAL_MS = 1000;
-const SLIDING_BUFFER_MS = 2000;
-const SLIDING_BUFFER_SAMPLES = Math.round((TARGET_SAMPLE_RATE * SLIDING_BUFFER_MS) / 1000);
+const CHUNK_DURATION_S = CHUNK_DURATION_MS / 1000;
 
 let audioBufferQueue: Int16Array[] = [];
 let queuedSamples = 0;
@@ -38,8 +37,9 @@ let pendingChunks: Map<number, { chunk: Int16Array; sentAt: number }> = new Map(
 let healthCheckIntervalId: number | null = null;
 let sessionStopped = true;
 let savedQueuedSamples = 0;
-let slidingBuffer: Int16Array[] = [];
-let slidingBufferSamples = 0;
+let slidingBuffer: { chunk: Int16Array; timestamp: number }[] = [];
+let lastTranscriptEndTime = 0;
+let currentAudioTimestamp = 0;
 
 function appendStatus(message: string) {
   transcriptEl.textContent += `\n[status] ${message}`;
@@ -189,7 +189,8 @@ async function stopSession() {
   nextSeqNo = 1;
   isReconnecting = false;
   slidingBuffer = [];
-  slidingBufferSamples = 0;
+  lastTranscriptEndTime = 0;
+  currentAudioTimestamp = 0;
 
   if (healthCheckIntervalId !== null) {
     clearInterval(healthCheckIntervalId);
@@ -232,6 +233,13 @@ function handleReceiveMessage({ data }: { data: any }) {
     }
     finalText = finalText.trim();
     transcriptEl.textContent = finalText;
+
+    // Update last transcript end time and trim sliding buffer
+    const endTime = data.metadata?.end_time;
+    if (typeof endTime === 'number' && endTime > lastTranscriptEndTime) {
+      lastTranscriptEndTime = endTime;
+      trimSlidingBuffer();
+    }
   } else if (data.message === 'EndOfTranscript') {
     appendStatus('End of transcript');
   } else if (data.message === 'AudioAdded') {
@@ -397,10 +405,11 @@ async function reconnectSession(url: string, language: string) {
   }
   isReconnecting = true;
 
-  // Use sliding buffer for replay - this includes recently sent audio that may not have been transcribed yet
-  const replayChunks = [...slidingBuffer];
+  // Use sliding buffer for replay - this includes audio after the last transcribed end_time
+  const replayChunks = slidingBuffer.map(entry => entry.chunk);
   slidingBuffer = [];
-  slidingBufferSamples = 0;
+  lastTranscriptEndTime = 0;
+  currentAudioTimestamp = 0;
 
   const savedQueue = [...audioBufferQueue];
   savedQueuedSamples = queuedSamples;
@@ -486,13 +495,14 @@ async function reconnectSession(url: string, language: string) {
 }
 
 function addToSlidingBuffer(chunk: Int16Array) {
-  slidingBuffer.push(chunk);
-  slidingBufferSamples += chunk.length;
+  slidingBuffer.push({ chunk, timestamp: currentAudioTimestamp });
+  currentAudioTimestamp += CHUNK_DURATION_S;
+}
 
-  // Trim buffer to keep only last SLIDING_BUFFER_SAMPLES
-  while (slidingBufferSamples > SLIDING_BUFFER_SAMPLES && slidingBuffer.length > 0) {
-    const removed = slidingBuffer.shift()!;
-    slidingBufferSamples -= removed.length;
+function trimSlidingBuffer() {
+  // Remove chunks that have been transcribed (timestamp < lastTranscriptEndTime)
+  while (slidingBuffer.length > 0 && slidingBuffer[0].timestamp < lastTranscriptEndTime) {
+    slidingBuffer.shift();
   }
 }
 
