@@ -570,6 +570,8 @@ async function sendLangId() {
 
 async function switchToLanguage(newLang: string, audioWindow: Int16Array) {
   const prevLang = languageInput.value.trim() || 'en';
+  finalText += `\n[Language: ${prevLang} → ${newLang}]`;
+  transcriptEl.textContent = finalText;
   appendStatus(`Language changed: ${prevLang} → ${newLang}, retranscribing buffer…`);
   languageInput.value = newLang;
 
