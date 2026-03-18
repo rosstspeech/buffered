@@ -12,6 +12,7 @@ if (!apiKey) {
 }
 
 const port = Number(process.env.PORT || 3000);
+const langIdUrl = process.env.LANG_ID_URL || 'http://127.0.0.1:8080/v1/language-identification';
 
 const server = http.createServer(async (req, res) => {
   if (!req.url) {
@@ -20,7 +21,27 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && req.url.startsWith('/speechmatics-jwt')) {
+  if (req.method === 'POST' && req.url.startsWith('/language-identification')) {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+
+    try {
+      const upstream = await fetch(langIdUrl, {
+        method: 'POST',
+        headers: { 'content-type': req.headers['content-type'] },
+        body
+      });
+      const json = await upstream.text();
+      res.statusCode = upstream.status;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(json);
+    } catch (err) {
+      console.error('Language ID request failed', err);
+      res.statusCode = 502;
+      res.end('Language ID request failed');
+    }
+  } else if (req.method === 'GET' && req.url.startsWith('/speechmatics-jwt')) {
     try {
       const jwt = await createSpeechmaticsJWT({
         type: 'rt',

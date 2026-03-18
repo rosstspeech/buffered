@@ -4,6 +4,15 @@ import {
   type InputAudioEvent
 } from '@speechmatics/browser-audio-input';
 import PCMAudioWorkletUrl from '@speechmatics/browser-audio-input/pcm-audio-worklet.min.js?url';
+import {
+  resampleTo16k,
+  int16ToLittleEndian,
+  createWavFile,
+  dequeueChunk as dequeueChunkPure,
+  trimSlidingBuffer as trimSlidingBufferPure
+} from './audio-utils';
+
+const LANG_ID_ENABLED = import.meta.env.VITE_LANG_ID_ENABLED !== 'false';
 
 const urlInput = document.getElementById('rt-url') as HTMLInputElement;
 const languageInput = document.getElementById('language') as HTMLInputElement;
@@ -14,6 +23,12 @@ const startButton = document.getElementById('start') as HTMLButtonElement;
 const stopButton = document.getElementById('stop') as HTMLButtonElement;
 const downloadButton = document.getElementById('download') as HTMLButtonElement;
 const transcriptEl = document.getElementById('transcript') as HTMLPreElement;
+const langIdEl = document.getElementById('lang-id') as HTMLDivElement;
+const langIdStatusEl = document.getElementById('lang-id-status') as HTMLSpanElement;
+
+if (!LANG_ID_ENABLED) {
+  langIdEl.closest('section')?.remove();
+}
 
 let audioContext: AudioContext | null = null;
 let pcmRecorder: PCMRecorder | null = null;
@@ -29,6 +44,10 @@ const ACK_TIMEOUT_MS = 3000;
 const MAX_DELAY = 1;
 const HEALTH_CHECK_INTERVAL_MS = 1000;
 const CHUNK_DURATION_S = CHUNK_DURATION_MS / 1000;
+const LANG_ID_INTERVAL = Number(import.meta.env.VITE_LANG_ID_INTERVAL ?? 10);
+const LANG_ID_ENDPOINT = '/language-identification';
+const LANG_ID_INTERVAL_MS = LANG_ID_INTERVAL * 1000;
+const LANG_ID_WINDOW_SAMPLES = TARGET_SAMPLE_RATE * LANG_ID_INTERVAL;
 
 let audioBufferQueue: Int16Array[] = [];
 let queuedSamples = 0;
@@ -40,6 +59,10 @@ let savedQueuedSamples = 0;
 let slidingBuffer: { chunk: Int16Array; timestamp: number }[] = [];
 let lastTranscriptEndTime = 0;
 let currentAudioTimestamp = 0;
+let langIdBuffer: Int16Array[] = [];
+let langIdTotalSamples = 0;
+let langIdIntervalId: number | null = null;
+let sessionGeneration = 0;
 
 function appendStatus(message: string) {
   transcriptEl.textContent += `\n[status] ${message}`;
@@ -132,7 +155,7 @@ async function startSession() {
     downloadButton.disabled = true;
 
     client.addEventListener('receiveMessage', handleReceiveMessage);
-    client.addEventListener('socketStateChange', createSocketStateHandler(url, language));
+    client.addEventListener('socketStateChange', createSocketStateHandler(url, language, sessionGeneration));
 
     await client.start(jwt, getStartConfig(language));
 
@@ -151,11 +174,16 @@ async function startSession() {
       const resampled = resampleTo16k(floats, inputSampleRate, TARGET_SAMPLE_RATE);
       recordedAudio.push(resampled);
       enqueueAudio(resampled);
+      if (LANG_ID_ENABLED) {
+        langIdBuffer.push(resampled);
+        langIdTotalSamples += resampled.length;
+      }
     });
 
     await pcmRecorder.startRecording({ audioContext });
 
     startHealthCheck(url, language);
+    if (LANG_ID_ENABLED) startLangIdPolling();
 
     sessionStopped = false;
     startButton.disabled = true;
@@ -191,6 +219,7 @@ async function stopSession() {
   slidingBuffer = [];
   lastTranscriptEndTime = 0;
   currentAudioTimestamp = 0;
+  stopLangIdPolling();
 
   if (healthCheckIntervalId !== null) {
     clearInterval(healthCheckIntervalId);
@@ -244,13 +273,11 @@ function handleReceiveMessage({ data }: { data: any }) {
     appendStatus('End of transcript');
   } else if (data.message === 'AudioAdded') {
     const ackSeqNo = data.seq_no;
-    // console.log(`AudioAdded ack: seq_no=${ackSeqNo}, pendingChunks before=${pendingChunks.size}`);
     if (typeof ackSeqNo === 'number') {
       for (let i = 1; i <= ackSeqNo; i++) {
         pendingChunks.delete(i);
       }
     }
-    // console.log(`AudioAdded ack: pendingChunks after=${pendingChunks.size}`);
   } else if (data.message === 'RecognitionStarted') {
     console.log('RecognitionStarted received');
   } else if (data.message === 'Error') {
@@ -258,9 +285,10 @@ function handleReceiveMessage({ data }: { data: any }) {
   }
 }
 
-function createSocketStateHandler(url: string, language: string) {
+function createSocketStateHandler(url: string, language: string, generation: number) {
   return (e: any) => {
     console.log('socket state:', e.socketState);
+    if (generation !== sessionGeneration) return;
     if (!sessionStopped && (e.socketState === 'closed' || e.socketState === 'error')) {
       appendStatus('WebSocket closed, reconnecting...');
       void reconnectSession(url, language);
@@ -330,73 +358,6 @@ function downloadWavFile() {
   appendStatus('WAV file downloaded');
 }
 
-function createWavFile(samples: Int16Array, sampleRate: number): ArrayBuffer {
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const bytesPerSample = bitsPerSample / 8;
-  const blockAlign = numChannels * bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = samples.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  const writeString = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
-  };
-
-  writeString(0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitsPerSample, true);
-  writeString(36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  for (let i = 0; i < samples.length; i++) {
-    view.setInt16(44 + i * 2, samples[i], true);
-  }
-
-  return buffer;
-}
-
-function resampleTo16k(
-  input: Float32Array,
-  inputSampleRate: number,
-  targetSampleRate: number
-): Int16Array {
-  if (inputSampleRate === targetSampleRate) {
-    return floatTo16BitPCM(input);
-  }
-
-  const ratio = inputSampleRate / targetSampleRate;
-  const newLength = Math.round(input.length / ratio);
-  const resampled = new Float32Array(newLength);
-
-  let offsetResult = 0;
-  let offsetBuffer = 0;
-  while (offsetResult < newLength) {
-    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-    let accum = 0;
-    let count = 0;
-    for (let i = offsetBuffer; i < nextOffsetBuffer && i < input.length; i++) {
-      accum += input[i];
-      count++;
-    }
-    resampled[offsetResult] = count > 0 ? accum / count : 0;
-    offsetResult++;
-    offsetBuffer = nextOffsetBuffer;
-  }
-
-  return floatTo16BitPCM(resampled);
-}
 
 async function reconnectSession(url: string, language: string) {
   if (isReconnecting) {
@@ -404,6 +365,7 @@ async function reconnectSession(url: string, language: string) {
     return;
   }
   isReconnecting = true;
+  sessionGeneration++;
 
   // Use sliding buffer for replay - this includes audio after the last transcribed end_time
   const replayChunks = slidingBuffer.map(entry => entry.chunk);
@@ -446,7 +408,7 @@ async function reconnectSession(url: string, language: string) {
   client = new RealtimeClient({ url });
 
   client.addEventListener('receiveMessage', handleReceiveMessage);
-  client.addEventListener('socketStateChange', createSocketStateHandler(url, language));
+  client.addEventListener('socketStateChange', createSocketStateHandler(url, language, sessionGeneration));
 
   await client.start(jwt, getStartConfig(language));
 
@@ -500,10 +462,7 @@ function addToSlidingBuffer(chunk: Int16Array) {
 }
 
 function trimSlidingBuffer() {
-  // Remove chunks that have been transcribed (timestamp < lastTranscriptEndTime)
-  while (slidingBuffer.length > 0 && slidingBuffer[0].timestamp < lastTranscriptEndTime) {
-    slidingBuffer.shift();
-  }
+  slidingBuffer = trimSlidingBufferPure(slidingBuffer, lastTranscriptEndTime);
 }
 
 function enqueueAudio(samples: Int16Array) {
@@ -534,54 +493,96 @@ function enqueueAudio(samples: Int16Array) {
 }
 
 function dequeueChunk(): Int16Array | null {
-  if (queuedSamples < CHUNK_SAMPLES) {
-    return null;
+  const result = dequeueChunkPure(audioBufferQueue, queuedSamples, CHUNK_SAMPLES);
+  if (!result) return null;
+  audioBufferQueue = result.remaining;
+  queuedSamples = result.remainingSamples;
+  return result.chunk;
+}
+
+function startLangIdPolling() {
+  if (langIdIntervalId !== null) clearInterval(langIdIntervalId);
+  langIdBuffer = [];
+  langIdTotalSamples = 0;
+  langIdStatusEl.textContent = `(waiting for ${LANG_ID_INTERVAL}s of audio…)`;
+  langIdIntervalId = window.setInterval(() => { void sendLangId(); }, LANG_ID_INTERVAL_MS);
+}
+
+function stopLangIdPolling() {
+  if (langIdIntervalId !== null) {
+    clearInterval(langIdIntervalId);
+    langIdIntervalId = null;
+  }
+  langIdBuffer = [];
+  langIdTotalSamples = 0;
+  langIdStatusEl.textContent = '(waiting…)';
+}
+
+async function sendLangId() {
+  if (langIdTotalSamples === 0) return;
+
+  // Flatten buffer into a single array
+  const combined = new Int16Array(langIdTotalSamples);
+  let offset = 0;
+  for (const chunk of langIdBuffer) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
   }
 
-  const chunk = new Int16Array(CHUNK_SAMPLES);
-  let filled = 0;
+  // Keep only the last N seconds in the buffer
+  const windowStart = Math.max(0, combined.length - LANG_ID_WINDOW_SAMPLES);
+  const audioWindow = combined.subarray(windowStart);
+  langIdBuffer = [audioWindow.slice()];
+  langIdTotalSamples = audioWindow.length;
 
-  while (filled < CHUNK_SAMPLES && audioBufferQueue.length > 0) {
-    const current = audioBufferQueue[0];
-    const remainingInCurrent = current.length;
-    const needed = CHUNK_SAMPLES - filled;
+  const wavBuffer = createWavFile(audioWindow, TARGET_SAMPLE_RATE);
+  const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+  const formData = new FormData();
+  formData.append('data_file', blob, 'audio.wav');
 
-    if (remainingInCurrent <= needed) {
-      chunk.set(current, filled);
-      filled += remainingInCurrent;
-      audioBufferQueue.shift();
-    } else {
-      const slice = current.subarray(0, needed);
-      chunk.set(slice, filled);
-      const leftover = current.subarray(needed);
-      audioBufferQueue[0] = leftover;
-      filled += needed;
+  langIdStatusEl.textContent = '(identifying…)';
+  try {
+    const response = await fetch(LANG_ID_ENDPOINT, { method: 'POST', body: formData });
+    if (!response.ok) {
+      langIdStatusEl.textContent = `(error ${response.status})`;
+      return;
     }
+    const data = (await response.json()) as {
+      predicted_language?: string;
+      results?: { alternatives?: { language: string; confidence: number }[] }[];
+    };
+    const predicted = data.predicted_language ?? '?';
+    const alternatives = data.results?.[0]?.alternatives ?? [];
+    langIdStatusEl.textContent = `(updated ${new Date().toLocaleTimeString()})`;
+    langIdEl.innerHTML = alternatives
+      .map(a => `<span style="margin-right:16px"><strong>${a.language}</strong> ${(a.confidence * 100).toFixed(0)}%${a.language === predicted ? ' ✓' : ''}</span>`)
+      .join('');
+
+    const currentLang = languageInput.value.trim() || 'en';
+    if (predicted !== '?' && predicted !== currentLang) {
+      void switchToLanguage(predicted, audioWindow);
+    }
+  } catch (e) {
+    console.warn('Language ID request failed:', e);
+    langIdStatusEl.textContent = '(request failed)';
   }
-
-  queuedSamples -= CHUNK_SAMPLES;
-  if (queuedSamples < 0) queuedSamples = 0;
-
-  return chunk;
 }
 
-function floatTo16BitPCM(input: Float32Array): Int16Array {
-  const output = new Int16Array(input.length);
-  for (let i = 0; i < input.length; i++) {
-    let s = input[i];
-    // clamp
-    if (s < -1) s = -1;
-    if (s > 1) s = 1;
-    output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+async function switchToLanguage(newLang: string, audioWindow: Int16Array) {
+  const prevLang = languageInput.value.trim() || 'en';
+  appendStatus(`Language changed: ${prevLang} → ${newLang}, retranscribing buffer…`);
+  languageInput.value = newLang;
+
+  // Replace sliding buffer with the window audio so reconnect replays it
+  slidingBuffer = [];
+  lastTranscriptEndTime = 0;
+  currentAudioTimestamp = 0;
+  for (let i = 0; i < audioWindow.length; i += CHUNK_SAMPLES) {
+    const chunk = audioWindow.slice(i, Math.min(i + CHUNK_SAMPLES, audioWindow.length));
+    slidingBuffer.push({ chunk, timestamp: currentAudioTimestamp });
+    currentAudioTimestamp += CHUNK_DURATION_S;
   }
-  return output;
+
+  await reconnectSession(urlInput.value.trim(), newLang);
 }
 
-function int16ToLittleEndian(input: Int16Array): Uint8Array {
-  const buffer = new ArrayBuffer(input.length * 2);
-  const view = new DataView(buffer);
-  for (let i = 0; i < input.length; i++) {
-    view.setInt16(i * 2, input[i], true); // little-endian
-  }
-  return new Uint8Array(buffer);
-}
