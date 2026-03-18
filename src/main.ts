@@ -34,6 +34,7 @@ let audioContext: AudioContext | null = null;
 let pcmRecorder: PCMRecorder | null = null;
 let client: RealtimeClient | null = null;
 let finalText = '';
+let currentSpeaker = '';
 let isReconnecting = false;
 let recordedAudio: Int16Array[] = [];
 
@@ -150,6 +151,7 @@ async function startSession() {
     const jwt = await fetchJwt();
     client = new RealtimeClient({ url });
     finalText = '';
+    currentSpeaker = '';
     transcriptEl.textContent = '';
     recordedAudio = [];
     downloadButton.disabled = true;
@@ -251,12 +253,19 @@ function handleReceiveMessage({ data }: { data: any }) {
   if (data.message === 'AddTranscript') {
     const results = data.results || [];
     for (const result of results) {
-      const content = result.alternatives?.[0]?.content;
+      const alt = result.alternatives?.[0];
+      const content = alt?.content;
       if (content) {
+        const speaker: string = alt?.speaker ?? '';
         if (result.type === 'punctuation') {
           finalText = `${finalText}${content}`;
         } else {
-          finalText = `${finalText} ${content}`;
+          if (speaker && speaker !== currentSpeaker) {
+            currentSpeaker = speaker;
+            finalText = `${finalText}\n${speaker}: ${content}`;
+          } else {
+            finalText = `${finalText} ${content}`;
+          }
         }
       }
     }
@@ -307,7 +316,11 @@ function getStartConfig(language: string) {
       language,
       operating_point: 'enhanced',
       enable_partials: true,
-      max_delay: MAX_DELAY
+      max_delay: MAX_DELAY,
+      diarization: "speaker",
+      speaker_diarization_config: {
+        speaker_sensitivity: 0.5
+      }
     }
   } as any;
 }
