@@ -56,15 +56,28 @@ function appendStatus(message: string) {
 }
 
 async function fetchJwt(): Promise<string> {
-  const response = await fetch('/speechmatics-jwt');
-  if (!response.ok) {
-    throw new Error(`JWT request failed with status ${response.status}`);
+  const MAX_ATTEMPTS = 3;
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetch('/speechmatics-jwt');
+      if (!response.ok) {
+        throw new Error(`JWT request failed with status ${response.status}`);
+      }
+      const data = (await response.json()) as { jwt?: string };
+      if (!data.jwt) {
+        throw new Error('JWT response did not contain a jwt field');
+      }
+      return data.jwt;
+    } catch (err: any) {
+      lastError = err;
+      if (attempt < MAX_ATTEMPTS) {
+        console.warn(`JWT fetch attempt ${attempt} failed, retrying…`, err);
+        await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+      }
+    }
   }
-  const data = (await response.json()) as { jwt?: string };
-  if (!data.jwt) {
-    throw new Error('JWT response did not contain a jwt field');
-  }
-  return data.jwt;
+  throw lastError;
 }
 
 async function populateLanguagesFromDiscovery() {
