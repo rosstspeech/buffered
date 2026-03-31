@@ -12,8 +12,6 @@ import {
   trimSlidingBuffer as trimSlidingBufferPure
 } from './audio-utils';
 
-const LANG_ID_ENABLED = import.meta.env.VITE_LANG_ID_ENABLED !== 'false';
-
 const urlInput = document.getElementById('rt-url') as HTMLInputElement;
 const languageInput = document.getElementById('language') as HTMLInputElement;
 const languageDatalist = document.getElementById(
@@ -23,12 +21,6 @@ const startButton = document.getElementById('start') as HTMLButtonElement;
 const stopButton = document.getElementById('stop') as HTMLButtonElement;
 const downloadButton = document.getElementById('download') as HTMLButtonElement;
 const transcriptEl = document.getElementById('transcript') as HTMLPreElement;
-const langIdEl = document.getElementById('lang-id') as HTMLDivElement;
-const langIdStatusEl = document.getElementById('lang-id-status') as HTMLSpanElement;
-
-if (!LANG_ID_ENABLED) {
-  langIdEl.closest('section')?.remove();
-}
 
 let audioContext: AudioContext | null = null;
 let pcmRecorder: PCMRecorder | null = null;
@@ -45,10 +37,6 @@ const ACK_TIMEOUT_MS = 3000;
 const MAX_DELAY = 1;
 const HEALTH_CHECK_INTERVAL_MS = 1000;
 const CHUNK_DURATION_S = CHUNK_DURATION_MS / 1000;
-const LANG_ID_INTERVAL = Number(import.meta.env.VITE_LANG_ID_INTERVAL ?? 10);
-const LANG_ID_ENDPOINT = '/language-identification';
-const LANG_ID_INTERVAL_MS = LANG_ID_INTERVAL * 1000;
-const LANG_ID_WINDOW_SAMPLES = TARGET_SAMPLE_RATE * LANG_ID_INTERVAL;
 
 let audioBufferQueue: Int16Array[] = [];
 let queuedSamples = 0;
@@ -60,9 +48,7 @@ let savedQueuedSamples = 0;
 let slidingBuffer: { chunk: Int16Array; timestamp: number }[] = [];
 let lastTranscriptEndTime = 0;
 let currentAudioTimestamp = 0;
-let langIdBuffer: Int16Array[] = [];
-let langIdTotalSamples = 0;
-let langIdIntervalId: number | null = null;
+
 let sessionGeneration = 0;
 
 function appendStatus(message: string) {
@@ -176,16 +162,11 @@ async function startSession() {
       const resampled = resampleTo16k(floats, inputSampleRate, TARGET_SAMPLE_RATE);
       recordedAudio.push(resampled);
       enqueueAudio(resampled);
-      if (LANG_ID_ENABLED) {
-        langIdBuffer.push(resampled);
-        langIdTotalSamples += resampled.length;
-      }
     });
 
     await pcmRecorder.startRecording({ audioContext });
 
     startHealthCheck(url, language);
-    if (LANG_ID_ENABLED) startLangIdPolling();
 
     sessionStopped = false;
     startButton.disabled = true;
@@ -221,7 +202,6 @@ async function stopSession() {
   slidingBuffer = [];
   lastTranscriptEndTime = 0;
   currentAudioTimestamp = 0;
-  stopLangIdPolling();
 
   if (healthCheckIntervalId !== null) {
     clearInterval(healthCheckIntervalId);
@@ -513,73 +493,6 @@ function dequeueChunk(): Int16Array | null {
   return result.chunk;
 }
 
-function startLangIdPolling() {
-  if (langIdIntervalId !== null) clearInterval(langIdIntervalId);
-  langIdBuffer = [];
-  langIdTotalSamples = 0;
-  langIdStatusEl.textContent = `(waiting for ${LANG_ID_INTERVAL}s of audio…)`;
-  langIdIntervalId = window.setInterval(() => { void sendLangId(); }, LANG_ID_INTERVAL_MS);
-}
-
-function stopLangIdPolling() {
-  if (langIdIntervalId !== null) {
-    clearInterval(langIdIntervalId);
-    langIdIntervalId = null;
-  }
-  langIdBuffer = [];
-  langIdTotalSamples = 0;
-  langIdStatusEl.textContent = '(waiting…)';
-}
-
-async function sendLangId() {
-  if (langIdTotalSamples === 0) return;
-
-  // Flatten buffer into a single array
-  const combined = new Int16Array(langIdTotalSamples);
-  let offset = 0;
-  for (const chunk of langIdBuffer) {
-    combined.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  // Keep only the last N seconds in the buffer
-  const windowStart = Math.max(0, combined.length - LANG_ID_WINDOW_SAMPLES);
-  const audioWindow = combined.subarray(windowStart);
-  langIdBuffer = [audioWindow.slice()];
-  langIdTotalSamples = audioWindow.length;
-
-  const wavBuffer = createWavFile(audioWindow, TARGET_SAMPLE_RATE);
-  const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-  const formData = new FormData();
-  formData.append('data_file', blob, 'audio.wav');
-
-  langIdStatusEl.textContent = '(identifying…)';
-  try {
-    const response = await fetch(LANG_ID_ENDPOINT, { method: 'POST', body: formData });
-    if (!response.ok) {
-      langIdStatusEl.textContent = `(error ${response.status})`;
-      return;
-    }
-    const data = (await response.json()) as {
-      predicted_language?: string;
-      results?: { alternatives?: { language: string; confidence: number }[] }[];
-    };
-    const predicted = data.predicted_language ?? '?';
-    const alternatives = data.results?.[0]?.alternatives ?? [];
-    langIdStatusEl.textContent = `(updated ${new Date().toLocaleTimeString()})`;
-    langIdEl.innerHTML = alternatives
-      .map(a => `<span style="margin-right:16px"><strong>${a.language}</strong> ${(a.confidence * 100).toFixed(0)}%${a.language === predicted ? ' ✓' : ''}</span>`)
-      .join('');
-
-    const currentLang = languageInput.value.trim() || 'en';
-    if (predicted !== '?' && predicted !== currentLang) {
-      void switchToLanguage(predicted, audioWindow);
-    }
-  } catch (e) {
-    console.warn('Language ID request failed:', e);
-    langIdStatusEl.textContent = '(request failed)';
-  }
-}
 
 async function switchToLanguage(newLang: string, audioWindow: Int16Array) {
   const prevLang = languageInput.value.trim() || 'en';
