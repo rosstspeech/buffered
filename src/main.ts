@@ -37,12 +37,14 @@ const ACK_TIMEOUT_MS = 3000;
 const MAX_DELAY = 1;
 const HEALTH_CHECK_INTERVAL_MS = 1000;
 const CHUNK_DURATION_S = CHUNK_DURATION_MS / 1000;
+const GET_SPEAKERS_INTERVAL_MS = 30000;
 
 let audioBufferQueue: Int16Array[] = [];
 let queuedSamples = 0;
 let nextSeqNo = 1;
 let pendingChunks: Map<number, { chunk: Int16Array; sentAt: number }> = new Map();
 let healthCheckIntervalId: number | null = null;
+let getSpeakersIntervalId: number | null = null;
 let sessionStopped = true;
 let savedQueuedSamples = 0;
 let slidingBuffer: { chunk: Int16Array; timestamp: number }[] = [];
@@ -50,13 +52,19 @@ let lastTranscriptEndTime = 0;
 let currentAudioTimestamp = 0;
 
 let sessionGeneration = 0;
+let enrolledSpeakers: { label: string; speaker_identifiers: string[] }[] = [];
+
+function formatSpeakerLabel(speaker: string): string {
+  const match = speaker.match(/^S(\d+)$/);
+  return match ? `Speaker ${match[1]}` : speaker;
+}
 
 function appendStatus(message: string) {
   transcriptEl.textContent += `\n[status] ${message}`;
 }
 
 async function fetchJwt(): Promise<string> {
-  const MAX_ATTEMPTS = 3;
+  const MAX_ATTEMPTS = 10;
   let lastError: Error | null = null;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
@@ -151,6 +159,7 @@ async function startSession() {
     client = new RealtimeClient({ url });
     finalText = '';
     currentSpeaker = '';
+    enrolledSpeakers = [];
     transcriptEl.textContent = '';
     recordedAudio = [];
     downloadButton.disabled = true;
@@ -180,6 +189,7 @@ async function startSession() {
     await pcmRecorder.startRecording({ audioContext });
 
     startHealthCheck(url, language);
+    startSpeakersPolling();
 
     sessionStopped = false;
     startButton.disabled = true;
@@ -220,6 +230,7 @@ async function stopSession() {
     clearInterval(healthCheckIntervalId);
     healthCheckIntervalId = null;
   }
+  stopSpeakersPolling();
 
   startButton.disabled = false;
   stopButton.disabled = true;
@@ -255,7 +266,7 @@ function handleReceiveMessage({ data }: { data: any }) {
         } else {
           if (speaker && speaker !== currentSpeaker) {
             currentSpeaker = speaker;
-            finalText = `${finalText}\n${speaker}: ${content}`;
+            finalText = `${finalText}\n${formatSpeakerLabel(speaker)}: ${content}`;
           } else {
             finalText = `${finalText} ${content}`;
           }
@@ -279,6 +290,14 @@ function handleReceiveMessage({ data }: { data: any }) {
       for (let i = 1; i <= ackSeqNo; i++) {
         pendingChunks.delete(i);
       }
+    }
+  } else if (data.message === 'SpeakersResult') {
+    if (Array.isArray(data.speakers) && data.speakers.length > 0) {
+      enrolledSpeakers = data.speakers.map((s: { label: string; speaker_identifiers: string[] }) => ({
+        ...s,
+        label: formatSpeakerLabel(s.label),
+      }));
+      console.log('SpeakersResult: enrolled speakers updated', enrolledSpeakers);
     }
   } else if (data.message === 'RecognitionStarted') {
     console.log('RecognitionStarted received');
@@ -310,9 +329,11 @@ function getStartConfig(language: string) {
       operating_point: 'enhanced',
       enable_partials: true,
       max_delay: MAX_DELAY,
-      diarization: "speaker",
+      diarization: 'speaker',
       speaker_diarization_config: {
-        speaker_sensitivity: 0.5
+        get_speakers: true,
+        speaker_sensitivity: 0.5,
+        ...(enrolledSpeakers.length > 0 ? { speakers: enrolledSpeakers } : {})
       }
     }
   } as any;
@@ -460,6 +481,32 @@ async function reconnectSession(url: string, language: string) {
   console.log(`Reconnect: complete, remaining queued samples: ${queuedSamples}`);
 
   startHealthCheck(url, language);
+  startSpeakersPolling();
+}
+
+function startSpeakersPolling() {
+  if (getSpeakersIntervalId !== null) clearInterval(getSpeakersIntervalId);
+  getSpeakersIntervalId = window.setInterval(async () => {
+    if (!client || sessionStopped || isReconnecting) return;
+    try {
+      const result = await client.getSpeakers();
+      if (result.speakers.length > 0) {
+        enrolledSpeakers = result.speakers.map((s: { label: string; speaker_identifiers: string[] }) => ({
+          ...s,
+          label: formatSpeakerLabel(s.label),
+        }));
+      }
+    } catch (e) {
+      console.warn('GetSpeakers request failed:', e);
+    }
+  }, GET_SPEAKERS_INTERVAL_MS);
+}
+
+function stopSpeakersPolling() {
+  if (getSpeakersIntervalId !== null) {
+    clearInterval(getSpeakersIntervalId);
+    getSpeakersIntervalId = null;
+  }
 }
 
 function addToSlidingBuffer(chunk: Int16Array) {
@@ -476,10 +523,10 @@ function enqueueAudio(samples: Int16Array) {
   audioBufferQueue.push(samples);
   queuedSamples += samples.length;
 
-  if (!client || sessionStopped || isReconnecting) {
-    console.log('enqueueAudio: skipping send', { hasClient: !!client, sessionStopped, isReconnecting, queuedSamples });
-    return;
-  }
+  // if (!client || sessionStopped || isReconnecting) {
+  //   console.log('enqueueAudio: skipping send', { hasClient: !!client, sessionStopped, isReconnecting, queuedSamples });
+  //   return;
+  // }
 
   let chunksSent = 0;
   while (queuedSamples >= CHUNK_SAMPLES) {
