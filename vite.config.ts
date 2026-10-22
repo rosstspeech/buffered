@@ -3,7 +3,8 @@ import { defineConfig } from 'vite';
 export default defineConfig({
   server: {
     proxy: {
-      '/speechmatics-jwt': 'http://localhost:3000'
+      '/api': 'http://localhost:3000',
+      '/speechmatics-jwt': 'http://localhost:3000',
     }
   },
   build: {
